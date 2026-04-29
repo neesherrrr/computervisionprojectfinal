@@ -1,0 +1,208 @@
+# %% 1- Load and Preprocess the Data
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import random
+
+# Check if GPU is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Define data transformations (with Data Augmentation)
+transform = transforms.Compose([
+    transforms.RandomCrop(32, padding=4), # Randomly crop images with padding
+    transforms.RandomHorizontalFlip(),  # Flip images horizontally
+    #transforms.RandomRotation(10),  # Rotate images randomly by 10 degrees
+    transforms.ToTensor(),  # Convert images to tensors
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize RGB channels
+])
+
+batch_size = 64
+cifar_root = './cifar_data'
+
+# Load Full CIFAR-10 dataset
+full_trainset = torchvision.datasets.CIFAR10(root=cifar_root, train=True, download=True, transform=transform)
+testset = torchvision.datasets.CIFAR10(root=cifar_root, train=False, download=True, transform=transform)
+
+# Train-Validation Split (80%-20%)
+from torch.utils.data import random_split
+train_size = int(0.8 * len(full_trainset))
+val_size = len(full_trainset) - train_size
+trainset, valset = random_split(full_trainset, [train_size, val_size])
+
+# Create DataLoaders
+train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True)
+val_loader = torch.utils.data.DataLoader(valset, batch_size=batch_size, shuffle=False)
+test_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False)
+
+print(f"Dataset split: {len(trainset)} training samples, {len(valset)} validation samples, {len(testset)} test samples.")
+
+# Function to show some random images from CIFAR-10
+def show_random_samples(loader, classes):
+    data_iter = iter(loader)
+    images, labels = next(data_iter)
+
+    fig, axes = plt.subplots(1, 5, figsize=(10, 5))
+    for i, ax in enumerate(axes):
+        img = images[i] / 2 + 0.5  # Unnormalize
+        img = img.permute(1, 2, 0).numpy()
+        ax.imshow(img)
+        ax.set_title(classes[labels[i].item()])
+        ax.axis('off')
+    plt.show()
+
+# Define CIFAR-10 classes
+classes = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+           'dog', 'frog', 'horse', 'ship', 'truck']
+
+# Display sample images
+show_random_samples(train_loader, classes)
+
+# %% 2- Define the Improved CNN Model
+class CNN(nn.Module):
+    def __init__(self):
+        super(CNN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)  # Batch Normalization
+
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)  # Batch Normalization
+
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.fc1 = nn.Linear(128 * 8 * 8, 256)
+        self.dropout1 = nn.Dropout(0.5)  # Dropout Layer
+
+        self.fc2 = nn.Linear(256, 128)
+        self.dropout2 = nn.Dropout(0.5)  # Dropout Layer
+
+        self.fc3 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = self.pool(torch.relu(self.bn1(self.conv1(x))))  # Apply BatchNorm
+        x = self.pool(torch.relu(self.bn2(self.conv2(x))))  # Apply BatchNorm
+        x = torch.flatten(x, 1)
+        x = torch.relu(self.fc1(x))
+        x = self.dropout1(x)  # Apply Dropout
+        x = torch.relu(self.fc2(x))
+        x = self.dropout2(x)  # Apply Dropout
+        x = self.fc3(x)
+        return x
+
+# Initialize Model
+model = CNN().to(device)
+
+# Define Loss, Optimizer & Scheduler
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Learning Rate Scheduler
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3) # Reduce LR if no improvement in val loss for 3 epochs
+
+# %% 4- Training the CNN with Validation Loss
+def train_model(model, train_loader, val_loader, epochs=10):
+    train_losses, val_losses = [], []
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        avg_train_loss = running_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # Validation Phase
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        scheduler.step(avg_val_loss)  # Adjust learning rate
+
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+    return train_losses, val_losses
+
+# Train Model
+train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=10)
+print("Training Finished!!!")
+
+# %% 5- Evaluate the CNN on Test Data
+def evaluate_model(model, test_loader):
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    print(f"Test Accuracy: {100 * correct / total:.2f}%")
+
+evaluate_model(model, test_loader)
+
+# %% 6- Plot Training & Validation Loss
+plt.plot(train_losses, label='Training Loss', color='blue')
+plt.plot(val_losses, label='Validation Loss', color='red')
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Loss Curve")
+plt.legend()
+plt.show()
+
+# %% 9- Show Model Predictions on Random Test Samples
+def show_predictions(model, test_loader, classes, num_samples=5):
+    data_iter = iter(test_loader)
+    images, labels = next(data_iter)
+
+    fig, axes = plt.subplots(1, num_samples, figsize=(10, 5))
+    for i, ax in enumerate(axes):
+        img = images[i] / 2 + 0.5  # Unnormalize
+        img = img.permute(1, 2, 0).numpy()
+
+        with torch.no_grad():
+            outputs = model(images[i:i+1].to(device))
+            predicted_label = torch.argmax(outputs, 1).item()
+
+        ax.imshow(img)
+        ax.set_title(f"True: {classes[labels[i].item()]}\nPred: {classes[predicted_label]}", 
+                     color='green' if predicted_label == labels[i].item() else 'red')
+        ax.axis('off')
+    plt.show()
+
+show_predictions(model, test_loader, classes)
+
+
+# %% 6- Visualize Filters of First Conv Layer
+def visualize_filters(model):
+    filters = model.conv1.weight.data.cpu().numpy()
+    
+    fig, axes = plt.subplots(4, 8, figsize=(8, 4))
+    for i, ax in enumerate(axes.flat):
+        if i < filters.shape[0]:
+            img = filters[i].transpose(1, 2, 0)
+            ax.imshow(img)
+            ax.axis('off')
+    plt.show()
+
+visualize_filters(model)
+# %%
