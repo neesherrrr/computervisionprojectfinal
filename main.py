@@ -1,9 +1,7 @@
 import copy
 import json
 import random
-from collections import Counter
 from pathlib import Path
-
 import matplotlib
 import numpy as np
 import torch
@@ -13,13 +11,15 @@ import torch.optim as optim
 import torchvision.transforms as transforms
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+# Root folder that contains the Vehicle-10 images and metadata files
 DATA_DIR = Path("vehicle-10")
-OUTPUT_DIR = Path("outputs")
+# Folder where the trained weights and plots will be saved
+OUTPUT_DIR = Path("outputs_5")
+# Fixed class order used by the dataset label ids 0-9
 CLASS_NAMES = [
     "bicycle",
     "boat",
@@ -32,16 +32,27 @@ CLASS_NAMES = [
     "train",
     "truck",
 ]
+#Resize all images to a common square input size for the CNN
 IMAGE_SIZE = 64
-BATCH_SIZE = 64
-EPOCHS = 12
+# Number of images processed together in each training step
+BATCH_SIZE = 128
+# Total number of passes over the training data
+EPOCHS = 20
+# Step size used by the Adam optimizer when updating weights
 LEARNING_RATE = 0.001
+TRAIN_SPLIT = 0.75
 VAL_SPLIT = 0.15
-NUM_WORKERS = 0
+TEST_SPLIT = 0.10
+NUM_WORKERS = 4
+# Seed used to make shuffling and splitting reproducible
 SEED = 42
+# Simple RGB normalization values used for all images
 MEAN = (0.5, 0.5, 0.5)
+# Standard deviation for the same RGB normalization step
 STD = (0.5, 0.5, 0.5)
+# Threshold used to convert the CAM heatmap into a coarse box
 CAM_THRESHOLD = 0.6
+# Number of test examples shown in the localization figure
 LOCALIZATION_SAMPLES = 8
 
 
@@ -50,25 +61,29 @@ class Vehicle10Dataset(Dataset):
         self.root = Path(root)
         self.transform = transform
 
+        # Vehicle-10 uses json files to map image paths to integer labels
         meta_file = "train_meta.json" if split == "train" else "valid_meta.json"
         with open(self.root / meta_file, "r", encoding="utf-8") as file:
             meta = json.load(file)
 
         self.samples = list(zip(meta["path"], meta["label"]))
 
+    
     def __len__(self):
         return len(self.samples)
 
+    #get individual image, return image and label
     def __getitem__(self, index):
         rel_path, label = self.samples[index]
         image = Image.open(self.root / rel_path).convert("RGB")
         image = self.transform(image)
-        return image, label, rel_path
+        return image, label
 
 
 class SimpleVehicleCNN(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
+        #CNN roughly based on lab, define layers, dropout, and normalization
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
@@ -77,15 +92,17 @@ class SimpleVehicleCNN(nn.Module):
         self.bn3 = nn.BatchNorm2d(128)
         self.pool = nn.MaxPool2d(2, 2)
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        self.dropout = nn.Dropout(0.35)
+        self.dropout = nn.Dropout(0.35) #disconnects 35% of neurons during training to prevent overfitting
         self.fc = nn.Linear(128, num_classes)
 
+    #Call layers in sequence
     def forward(self, x, return_features=False):
         x = self.pool(torch.relu(self.bn1(self.conv1(x))))
         x = self.pool(torch.relu(self.bn2(self.conv2(x))))
         features = torch.relu(self.bn3(self.conv3(x)))
         x = self.gap(features)
         x = torch.flatten(x, 1)
+        #perform dropout to prevent overfitting
         x = self.dropout(x)
         logits = self.fc(x)
         if return_features:
@@ -102,7 +119,7 @@ def evaluate(model, loader, criterion, device):
     all_predictions = []
 
     with torch.no_grad():
-        for images, labels, _ in loader:
+        for images, labels in loader:
             images = images.to(device)
             labels = labels.to(device)
 
@@ -120,6 +137,7 @@ def evaluate(model, loader, criterion, device):
 
 
 def main():
+    #fixed seed for reproducibility
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -127,13 +145,15 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    #always runs CPU for some reason
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print(f"Classes: {CLASS_NAMES}")
+
 
     train_transform = transforms.Compose(
         [
             transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            #slight image transformation helps the model generalize better
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(MEAN, STD),
@@ -146,30 +166,22 @@ def main():
             transforms.Normalize(MEAN, STD),
         ]
     )
-
+    #create different data sets
     full_train_aug = Vehicle10Dataset(DATA_DIR, "train", train_transform)
     full_train_eval = Vehicle10Dataset(DATA_DIR, "train", eval_transform)
     full_test = Vehicle10Dataset(DATA_DIR, "valid", eval_transform)
 
-    train_counts = Counter(label for _, label in full_train_aug.samples)
-    test_counts = Counter(label for _, label in full_test.samples)
-    print("\nOfficial train split summary:")
-    for i, class_name in enumerate(CLASS_NAMES):
-        print(f"  {class_name:12s}: {train_counts[i]}")
-    print("\nOfficial valid/test split summary:")
-    for i, class_name in enumerate(CLASS_NAMES):
-        print(f"  {class_name:12s}: {test_counts[i]}")
-
+    #create validation split
     indices = list(range(len(full_train_aug)))
     random.Random(SEED).shuffle(indices)
     val_size = int(len(indices) * VAL_SPLIT)
     train_indices = indices[val_size:]
     val_indices = indices[:val_size]
-
     train_set = Subset(full_train_aug, train_indices)
     val_set = Subset(full_train_eval, val_indices)
     test_set = Subset(full_test, list(range(len(full_test))))
 
+    
     train_loader = DataLoader(
         train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS
     )
@@ -181,13 +193,14 @@ def main():
     )
 
     print(
-        f"\nWorking split sizes -> Train: {len(train_set)}, "
+        f"\nWorking split sizes: Train: {len(train_set)}, "
         f"Val: {len(val_set)}, Test: {len(test_set)}"
     )
 
     model = SimpleVehicleCNN(len(CLASS_NAMES)).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    #reduce LR
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2
     )
@@ -205,8 +218,8 @@ def main():
         total_correct = 0
         total_samples = 0
         total_batches = len(train_loader)
-
-        for batch_index, (images, labels, _) in enumerate(train_loader, start=1):
+        
+        for batch_index, (images, labels) in enumerate(train_loader, start=1):
             images = images.to(device)
             labels = labels.to(device)
 
@@ -220,7 +233,7 @@ def main():
             total_loss += loss.item() * images.size(0)
             total_correct += (predictions == labels).sum().item()
             total_samples += labels.size(0)
-
+    
             filled = int(20 * batch_index / total_batches)
             bar = "#" * filled + "-" * (20 - filled)
             print(
@@ -241,6 +254,7 @@ def main():
         train_accuracies.append(train_accuracy)
         val_accuracies.append(val_accuracy)
 
+        #keep weights from best validation epoch, not necessarily the last one
         if val_accuracy >= best_val_accuracy:
             best_val_accuracy = val_accuracy
             best_model_state = copy.deepcopy(model.state_dict())
@@ -256,6 +270,9 @@ def main():
     test_loss, test_accuracy, test_labels, test_predictions = evaluate(
         model, test_loader, criterion, device
     )
+
+
+    #create and save plots for presentation
     print(f"\nTest Loss: {test_loss:.4f} | Test Accuracy: {test_accuracy * 100:.2f}%")
 
     plt.figure(figsize=(8, 5))
@@ -291,7 +308,14 @@ def main():
     plt.yticks(range(len(CLASS_NAMES)), CLASS_NAMES)
     for row in range(confusion.shape[0]):
         for col in range(confusion.shape[1]):
-            plt.text(col, row, str(confusion[row, col]), ha="center", va="center", color="black")
+            plt.text(
+                col,
+                row,
+                str(confusion[row, col]),
+                ha="center",
+                va="center",
+                color="black",
+            )
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
     plt.title("Confusion Matrix")
@@ -299,8 +323,8 @@ def main():
     plt.savefig(OUTPUT_DIR / "confusion_matrix.png")
     plt.close()
 
-    sample_count = min(LOCALIZATION_SAMPLES, len(full_test))
-    sample_indices = random.Random(7).sample(range(len(full_test)), sample_count)
+    sample_count = min(LOCALIZATION_SAMPLES, len(test_set))
+    sample_indices = random.Random(7).sample(range(len(test_set)), sample_count)
     cols = min(4, sample_count)
     rows = int(np.ceil(sample_count / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
@@ -308,7 +332,7 @@ def main():
 
     model.eval()
     for axis, sample_index in zip(axes, sample_indices):
-        image_tensor, label, rel_path = full_test[sample_index]
+        image_tensor, label, rel_path = test_set[sample_index]
         with torch.no_grad():
             logits, features = model(image_tensor.unsqueeze(0).to(device), return_features=True)
 
@@ -364,6 +388,7 @@ def main():
     fig.savefig(OUTPUT_DIR / "localized_predictions.png")
     plt.close(fig)
 
+    #save weights to prevent retraining
     torch.save(model.state_dict(), OUTPUT_DIR / "vehicle10_cnn.pth")
     print(f"\nSaved outputs to: {OUTPUT_DIR.resolve()}")
 
